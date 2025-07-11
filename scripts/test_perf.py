@@ -102,6 +102,12 @@ async def run_benchmark(num_requests, concurrency,  llm_url, model):
     avg_ttft = sum(ttft_list) / len(ttft_list) if ttft_list else 0
     avg_ms_per_token = sum(ms_per_token_list) / len(ms_per_token_list) if ms_per_token_list else None
 
+    latency_info = sorted(
+        [(i, r[1]) for i, r in enumerate(results) if r and r[1] is not None],
+        key=lambda x: x[1]
+    )
+    latency_list = "  ".join(f"{i}:{latency:.3f}s" for i, latency in latency_info)
+
     width_label = 18
     sep = "-" * 50
 
@@ -119,7 +125,8 @@ async def run_benchmark(num_requests, concurrency,  llm_url, model):
     print(f"{'Avg time per token':<{width_label}}: {avg_ms_per_token:.2f} ms/token")
     print(f"{'Avg Token generation speed':<{width_label}}: {avg_tokens_per_second:.2f} tokens/s")
     print(sep)
-
+    print("\n>>> 各请求延迟（从低到高）:")
+    print(latency_list)
 
 
 if __name__ == "__main__":
