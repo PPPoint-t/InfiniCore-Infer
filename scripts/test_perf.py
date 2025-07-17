@@ -1,9 +1,25 @@
+"""
+Multi-request and multi-concurrency Tool
+
+Usage:
+    python test_perf.py <num_requests> <concurrency> <api_url> <model> [--verbose]
+
+Arguments:
+    <num_requests>    Number of total requests to send (e.g. 100)
+    <concurrency>     Number of concurrent requests (e.g. 10)
+    <api_url>         OpenAI-compatible base URL (e.g. http://localhost:8000)
+    <model>           Model name to test (e.g. jiuge)
+    --verbose         (Optional) Print per-request details
+
+Example:
+    python scripts/test_perf.py 50 5 http://127.0.0.1:8000 jiuge --verbose
+"""
+
+import argparse
 import asyncio
 import time
-from openai import AsyncOpenAI
-import argparse
 import random
-
+from openai import AsyncOpenAI
 
 PROMPTS = [
     "如果猫能写诗，它们会写些什么？",
@@ -28,118 +44,101 @@ PROMPTS = [
     "想象一下，如果每个人都能读懂他人的思想。"
 ]
 
+def ljust_cn(s: str, width: int) -> str:
+    """Pad a string to width accounting for mixed char widths"""
+    # crude approximation: Chinese chars count as width 2
+    pad = width - sum(2 if ord(c) > 255 else 1 for c in s)
+    return s + " " * max(0, pad)
 
-async def benchmark_user(client, semaphore, queue, results, model):
+async def benchmark_user(worker_id, client, semaphore, queue, results, model, verbose):
     while True:
         async with semaphore:
             task_id = await queue.get()
             if task_id is None:
                 queue.task_done()
                 break
-            print(f"🚀 Sending request #{task_id}")
-            start_time = time.time()
-            content =  random.choice(PROMPTS)
-            stream = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": content}],
-                stream=True
-            )
+            start = time.time()
+            prompt = random.choice(PROMPTS)
+            if verbose:
+                print(f"🚀 [Req {task_id}] Worker-{worker_id} Prompt: {prompt}")
+            try:
+                stream = await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=True
+                )
+                first_time = None
+                tokens = 0
+                response = ""
+                async for chunk in stream:
+                    txt = chunk.choices[0].delta.content
+                    if txt:
+                        response += txt
+                        tokens += 1
+                        if first_time is None:
+                            first_time = time.time()
+                    if chunk.choices[0].finish_reason is not None:
+                        break
+                end = time.time()
+                latency = end - start
+                ttft = (first_time - start) if first_time else 0
+                avg_tok = latency / tokens * 1000 if tokens else 0
+                results.append((task_id, worker_id, ttft, latency, tokens, avg_tok, prompt, response))
+                if verbose:
+                    print("""
+   TTFT            : {:.3f} s
+   Latency         : {:.3f} s
+   Tokens         : {}
+   Avg/token      : {:.2f} ms
+   Response       : {}...
+""".format(ttft, latency, tokens, avg_tok, response[:100]))
+            except Exception as e:
+                print(f"❌ [Req {task_id}] Worker-{worker_id} failed: {e}")
+            finally:
+                queue.task_done()
 
-            first_token_time = None
-            total_tokens = 0
-            async for chunk in stream:
-                if first_token_time is None:
-                    first_token_time = time.time()
-                if chunk.choices[0].delta.content:
-                    # print(chunk.choices[0].delta.content, end="", flush=True)
-                    total_tokens += 1
-                if chunk.choices[0].finish_reason is not None:
-                    break
-
-            end_time = time.time()
-            elapsed_time = end_time - start_time
-            ttft = first_token_time - start_time if first_token_time else None
-            tokens_per_second = total_tokens / elapsed_time if elapsed_time > 0 else 0
-            ms_per_token = (elapsed_time / total_tokens * 1000) if total_tokens > 0 else None
-
-            results.append((total_tokens, elapsed_time, tokens_per_second, ttft, ms_per_token))
-            queue.task_done()
-
-
-async def run_benchmark(num_requests, concurrency,  llm_url, model):
-    client = AsyncOpenAI(base_url=llm_url, api_key="default")
-    semaphore = asyncio.Semaphore(concurrency)
+async def run_benchmark(num_requests, concurrency, api_url, model, verbose):
+    print(f"🔗 Connecting to {api_url}, model {model}")
+    client = AsyncOpenAI(base_url=api_url, api_key="default")
+    sem = asyncio.Semaphore(concurrency)
     queue = asyncio.Queue()
     results = []
-
-    for i in range(num_requests):
-        await queue.put(i)
-    
-    for _ in range(concurrency):
-        await queue.put(None)
-
-
-    users = [asyncio.create_task(benchmark_user(client, semaphore, queue, results, model)) for _ in range(concurrency)]
-
-    start_time = time.time()
-    
+    for i in range(num_requests): await queue.put(i)
+    for _ in range(concurrency): await queue.put(None)
+    tasks = [asyncio.create_task(benchmark_user(i, client, sem, queue, results, model, verbose)) for i in range(concurrency)]
+    st = time.time()
     await queue.join()
-    await asyncio.gather(*users)
-    end_time = time.time()
+    await asyncio.gather(*tasks)
+    et = time.time()
+    total = et - st
+    success = len(results)
+    rps = success / total if total else 0
+    total_tokens = sum(r[4] for r in results)
+    avg_latency = sum(r[3] for r in results)/success if success else 0
+    avg_ttft = sum(r[2] for r in results)/success if success else 0
+    avg_tok_ms = sum(r[5] for r in results)/success if success else 0
+    tok_speed = total_tokens/total if total else 0
+    w = 26
+    print("\n=== 📊 性能指标汇总 ===")
+    print("-"*60)
+    print(f"{ljust_cn('并发数',w)}: {concurrency}")
+    print(f"{ljust_cn('请求总数',w)}: {num_requests}")
+    print(f"{ljust_cn('成功请求数',w)}: {success}")
+    print(f"{ljust_cn('总耗时',w)}: {total:>7.2f} s")
+    print(f"{ljust_cn('总输出token数',w)}: {total_tokens}")
+    print(f"{ljust_cn('请求速率 (RPS)',w)}: {rps:>7.2f} req/s")
+    print(f"{ljust_cn('Average latency',w)}: {avg_latency:>7.2f} s")
+    print(f"{ljust_cn('Average TTFT',w)}: {avg_ttft:>7.2f} s")
+    print(f"{ljust_cn('Avg time per token',w)}: {avg_tok_ms:>7.2f} ms/token")
+    print(f"{ljust_cn('Token generation speed',w)}: {tok_speed:>7.2f} tok/s")
+    print("-"*60)
 
-    # Calculate metrics
-    total_elapsed_time = end_time - start_time
-    tokens_list = [r[0] for r in results if r and r[0] is not None]
-    latencies = [r[1] for r in results if r and r[1] is not None]
-    tokens_per_second_list = [r[2] for r in results if r and r[2] is not None]
-    ttft_list = [r[3] for r in results if r and r[3] is not None]
-    ms_per_token_list = [r[4] for r in results if r and r[4] is not None]
-
-    successful_requests = len(results)
-    requests_per_second = successful_requests / total_elapsed_time if total_elapsed_time > 0 else 0
-    avg_latency = sum(latencies) / len(latencies) if latencies else 0
-    avg_tokens_per_second = sum(tokens_per_second_list) / len(tokens_per_second_list) if tokens_per_second_list else 0
-    avg_ttft = sum(ttft_list) / len(ttft_list) if ttft_list else 0
-    avg_ms_per_token = sum(ms_per_token_list) / len(ms_per_token_list) if ms_per_token_list else None
-
-    latency_info = sorted(
-        [(i, r[1]) for i, r in enumerate(results) if r and r[1] is not None],
-        key=lambda x: x[1]
-    )
-    latency_list = "  ".join(f"{i}:{latency:.3f}s" for i, latency in latency_info)
-
-    width_label = 18
-    sep = "-" * 50
-
-    print(f"\n=== 📊 性能指标汇总 ({model}) ===")
-    print(sep)
-    print(f"{'并发数':<{width_label}}: {concurrency}")
-    print(f"{'请求总数':<{width_label}}: {num_requests}")
-    print(f"{'成功请求数':<{width_label}}: {successful_requests}")
-    print(f"{'总耗时':<{width_label}}: {total_elapsed_time:.2f} s")
-    print(f"{'总输出token数':<{width_label}}: {sum(tokens_list)}")
-    print(f"{'请求速率 (RPS)':<{width_label}}: {requests_per_second:.2f} requests/s")
-    print(sep)
-    print(f"{'Average latency':<{width_label}}: {avg_latency:.2f} s")
-    print(f"{'Average TTFT':<{width_label}}: {avg_ttft:.2f} s")
-    print(f"{'Avg time per token':<{width_label}}: {avg_ms_per_token:.2f} ms/token")
-    print(f"{'Avg Token generation speed':<{width_label}}: {avg_tokens_per_second:.2f} tokens/s")
-    print(sep)
-    print("\n>>> 各请求延迟（从低到高）:")
-    print(latency_list)
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num_requests", type=int, required=True)
-    parser.add_argument("--concurrency", type=int, required=True)
-    parser.add_argument("--api_url", type=str, required=True)
-    parser.add_argument("--model", type=str, default="FM9G-7B")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Multi-concurrency performance testing')
+    parser.add_argument('num_requests', type=int, help='total requests')
+    parser.add_argument('concurrency', type=int, help='parallel workers')
+    parser.add_argument('api_url', type=str, help='API base URL')
+    parser.add_argument('model', type=str, help='model name')
+    parser.add_argument('--verbose', action='store_true', help='detailed per-request info')
     args = parser.parse_args()
-
-    asyncio.run(run_benchmark(
-        args.num_requests, 
-        args.concurrency, 
-        args.api_url, 
-        args.model,
-    ))
+    asyncio.run(run_benchmark(args.num_requests, args.concurrency, args.api_url, args.model, args.verbose))
