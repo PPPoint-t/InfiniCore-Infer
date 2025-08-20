@@ -412,6 +412,7 @@ class JiugeForCauslLM:
         with open(os.path.join(model_dir_path, "config.json"), "r") as f:
             config = json.load(f)
             self.config = config
+            self.model_type = config["model_type"]
         eos_token_id = self.config["eos_token_id"]
         self.eos_token_id = (
             [eos_token_id] if type(eos_token_id) == int else eos_token_id
@@ -498,8 +499,55 @@ class JiugeForCauslLM:
                 self.tokenizer = transformers.AutoTokenizer.from_pretrained(
                     model_dir_path
                 )
+        elif "qwen3" == config["model_type"]:
+            state_dict = load_all_safetensors_from_dir(model_dir_path)
+            print("qwen3: loaded state_dict keys sample:")
+            # for i, k in enumerate(sorted(state_dict.keys())):
+            #     if i >= 60:
+            #         break
+            #     print(i, k, tuple(state_dict[k].shape), state_dict[k].dtype)
+            # try Llama-style mapping first
+            if LlamaWeightsNaming.match(state_dict):
+                self.meta = JiugeMetaFromLlama(config, max_tokens=max_tokens)
+                self.weights = JiugeWeightsImpl(
+                    self.meta,
+                    LlamaWeightsNaming(),
+                    state_dict,
+                    ndev=ndev,
+                    transpose_weight=transpose_weight,
+                )
+                self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                    model_dir_path, trust_remote_code=True, use_fast=True
+                )
+            else:
+                raise ValueError("Qwen3 weight naming not recognized.")
         else:
             raise ValueError("Unsupported model architecture")
+            
+        import sys, traceback
+
+        try:
+            print("== Tokenizer debug ==")
+            print("Tokenizer class:", type(self.tokenizer))
+            print("Tokenizer is_fast:", getattr(self.tokenizer, "is_fast", None))
+            print("Has attribute 'backend_tokenizer'?:", hasattr(self.tokenizer, "backend_tokenizer"))
+            try:
+                sample_token = self.tokenizer.convert_ids_to_tokens(0)
+                print("convert_ids_to_tokens(0):", sample_token)
+            except Exception as e:
+                print("convert_ids_to_tokens(0) raised:", repr(e))
+            try:
+                print("decode [0,1]:", self.tokenizer.decode([0, 1], skip_special_tokens=False))
+            except Exception as e:
+                print("decode [0,1] raised:", repr(e))
+            if hasattr(self.tokenizer, "_tokenizer"):
+                try:
+                    print("Has _tokenizer (fast backend). id_to_token(0):", self.tokenizer._tokenizer.id_to_token(0))
+                except Exception:
+                    pass
+            print("== End Tokenizer debug ==")
+        except Exception:
+            traceback.print_exc(file=sys.stdout)
 
         load_end_time = time.time()
         print(f"Time used: {load_end_time - load_start_time:.3f}s")
@@ -558,17 +606,53 @@ class JiugeForCauslLM:
         steps = 0
         total_time = 0
         output_content = ""
+    
+        def bytes_to_unicode():
+            bs = list(range(ord("!"), ord("~") + 1))
+            bs += list(range(ord("¡"), ord("¬") + 1))
+            bs += list(range(ord("®"), ord("ÿ") + 1))
+            cs = bs[:]
+            n = 0
+            for b in range(256):
+                if b not in bs:
+                    bs.append(b)
+                    cs.append(256 + n)
+                    n += 1
+            cs = [chr(c) for c in cs]
+            return dict(zip(bs, cs))
+
+        _byte_decoder = {v: k for k, v in bytes_to_unicode().items()}
+
+        def piece_to_text(piece: str) -> str:
+            ba = bytearray()
+            for ch in piece:
+                b = _byte_decoder.get(ch)
+                if b is not None:
+                    ba.append(b)
+            text = ba.decode('utf-8', errors='replace')
+            if not text or all(ord(c) < 32 or ord(c) == 127 for c in text):
+                return ''
+            return text
 
         for step_i in range(max_steps):
             start_time = time.time()
             output_tokens = self.batch_infer_one_round([infer_task])
             end_time = time.time()
             steps += 1
-            output_str = (
-                self.tokenizer._tokenizer.id_to_token(output_tokens[0])
-                .replace("▁", " ")
-                .replace("<0x0A>", "\n")
-            )
+            # print(f"self.model_type: {self.model_type}")
+            if self.model_type == "qwen2" or self.model_type == "qwen3":
+                token_piece = self.tokenizer.convert_ids_to_tokens(output_tokens[0])
+                output_str = (
+                    piece_to_text(token_piece)                    
+                    .replace("▁", " ")
+                    .replace("<0x0A>", "\n")
+                )
+            else:
+                output_str = (
+                    self.tokenizer._tokenizer.id_to_token(output_tokens[0])
+                    .replace("▁", " ")
+                    .replace("<0x0A>", "\n")
+                )
             output_content += output_str
             print(output_str, end="", flush=True)
             if output_tokens[0] in self.eos_token_id:
